@@ -1,4 +1,4 @@
-name: ssm
+name: extract
 channels:
   - conda-forge
   - defaults
@@ -243,4 +243,4 @@ dependencies:
       - tifffile==2023.9.26
       - tqdm==4.66.1
       - tzdata==2023.3
-prefix: /ext3/miniconda3/envs/ssm
+prefix: /ext3/miniconda3/envs/extract
