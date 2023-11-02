@@ -151,19 +151,19 @@ def extract_crema(
             
             resampled_crema_pitch = librosa.resample(
                 crema_out['chord_pitch'].T, 
-                orig_sr=crema_op.hop_length / crema_op.sr, 
+                orig_sr=crema_op.sr / crema_op.hop_length, 
                 target_sr=22050/4096
             )
             
             resampled_crema_root = librosa.resample(
                 crema_out['chord_root'].T, 
-                orig_sr=crema_op.hop_length / crema_op.sr, 
+                orig_sr=crema_op.sr / crema_op.hop_length, 
                 target_sr=22050/4096
             )
             
             resampled_crema_bass = librosa.resample(
                 crema_out['chord_bass'].T, 
-                orig_sr = crema_op.hop_length / crema_op.sr, 
+                orig_sr = crema_op.sr / crema_op.hop_length, 
                 target_sr = 22050/4096
             )
 
