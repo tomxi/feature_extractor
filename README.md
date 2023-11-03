@@ -1,5 +1,5 @@
 # feature_extractor
-script for extracting audio multiple representations.
+script for extracting multiple audio representations.
 
 ## Usage:
 Setup environment with conda:
@@ -9,7 +9,7 @@ conda env create -f extract_env.yml
 conda activate extract
 ```
 
-Run script on all audio files in a directory
+Run the script on all audio files in a directory
 ```
 python extract_features.py /path/to/input/audio/directory /path/to/feature/output/directory [--recompute]
 ```
