@@ -7,6 +7,7 @@ import torch
 import tensorflow as tf
 import tensorflow_hub as tf_hub
 import librosa
+import gc
 import librosa.display
 import openl3
 import openl3.models
@@ -22,6 +23,17 @@ def torch_device_default():
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+def clear_gpu_memory():
+    """Clear GPU memory for both PyTorch and TensorFlow"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    
+    # Clear TensorFlow memory
+    tf.keras.backend.clear_session()
+    gc.collect()
 
 
 @lru_cache(maxsize=32)
@@ -238,12 +250,20 @@ if __name__ == '__main__':
 
     for audio_path in tqdm(audio_paths):
         try:
+            # Process features one by one with memory clearing
             mfcc(audio_path, feats_dir, beats_dir, kwargs.recompute)
             tempogram(audio_path, feats_dir, beats_dir, kwargs.recompute)
             crema_emb(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            clear_gpu_memory()
+
             openl3_emb(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            clear_gpu_memory()
+
             yamnet_emb(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            clear_gpu_memory()
+            
         except Exception as e:
             print(f"Failed to process {audio_path}: {type(e).__name__}: {e}")
+            clear_gpu_memory()  # Clear memory even on failure
     
     
