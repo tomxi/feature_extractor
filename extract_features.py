@@ -1,190 +1,225 @@
-import os
-from tqdm import tqdm
+from beat_this.inference import Audio2Beats
+
 import argparse
+import os
 import numpy as np
-
+import torch
+import tensorflow as tf
+import tensorflow_hub as tf_hub
 import librosa
-import crema
+import librosa.display
 import openl3
-import tensorflow_hub as hub
+import openl3.models
+import crema
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from functools import lru_cache
+
+def torch_device_default():
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
-def extract_openl3_yamnet(
-    audio_dir = '/scratch/qx244/data/salami/audio/10/', 
-    feature_dir = '/scratch/qx244/data/salami/script_out/',
-    recompute = False,
-):
-    # create output directory if not already there.
-    if not os.path.exists(feature_dir):
-        os.makedirs(feature_dir)
+@lru_cache(maxsize=32)
+def cached_load_audio(audio_path, sr):
+    return librosa.load(str(audio_path), sr=sr)
+
+
+@lru_cache(maxsize=1)
+def load_beat_model(device: str):
+    return Audio2Beats(checkpoint_path="final0", device=device, dbn=False)
+
+
+@lru_cache(maxsize=1)
+def load_yamnet_model():
+    return tf_hub.load('https://tfhub.dev/google/yamnet/1')
+
+
+@lru_cache(maxsize=1)
+def load_openl3_model():
+    return openl3.models.load_audio_embedding_model(
+        'mel256', 'music', 512, frontend='kapre'
+    )
+
+
+@lru_cache(maxsize=1)
+def load_crema_model():
+    return crema.models.chord.ChordModel()
+
+
+def get_track_basename(audio_path):
+    track_bn = os.path.basename(audio_path).split('.')[0]
+    if track_bn == 'audio':
+        track_bn = os.path.dirname(audio_path).split('/')[-1]
+    return track_bn
+
+
+def ensure_beat_boundaries(beats_arr, track_dur):
+    if beats_arr[0] > 0:
+        beats_arr = np.insert(beats_arr, 0, 0)
+    if beats_arr[-1] < track_dur:
+        beats_arr = np.append(beats_arr, track_dur)
+    return beats_arr
+
+
+def beats(audio_path, output_dir='beats', recompute=False):
+    os.makedirs(output_dir, exist_ok=True)
+    track_bn = get_track_basename(audio_path)
+    beat_path = os.path.join(output_dir, f'{track_bn}_beats.npz')
     
-    audio_files = [f for f in os.listdir(audio_dir) if os.path.isfile(os.path.join(audio_dir, f))]
-    audio_paths = [os.path.join(audio_dir, f) for f in audio_files]
-    feat_paths = []
+    if recompute or not os.path.exists(beat_path):
+        beat_model = load_beat_model(torch_device_default())
+        y, sr = cached_load_audio(audio_path, 22050)
+        beats, downbeats = beat_model(y, sr)
+        
+        track_dur = np.round(librosa.get_duration(path=audio_path), 3)
+        beats = ensure_beat_boundaries(beats, track_dur)
+        downbeats = ensure_beat_boundaries(downbeats, track_dur)
+        
+        np.savez(beat_path, beats=beats, downbeats=downbeats)
+    return np.load(beat_path)
+
+
+def beat_sync(feat, track_beats, feat_sr):
+    """Synchronizes embeddings to beats, removing invalid beat frames.
+
+    Args:
+        feat (np.ndarray): Array of embeddings (D X T).
+        track_beats (np.ndarray): Array of beat timestamps (T,).
+        feat_sr (float): Sample rate of the features.
+
+    Returns:
+        tuple: A tuple containing:
+            - np.ndarray: Beat-synchronized embeddings (D X B).
+            - np.ndarray: Corrected beat timestamps (B,).
+    """
+    beat_frames = librosa.time_to_samples(track_beats, sr=feat_sr)
+    # make the last frame at least as long as the num feature frames.
+    # If we don't do this, then librosa.util.sync will pad the beat_frames array,
+    # which will cause the synced_feat to have an extra frame.
+    if beat_frames[-1] < feat.shape[1]:
+        beat_frames[-1] = feat.shape[1]
+
+    # Find bad beat frames: repeated values or out of bounds
+    rep_idx = np.where(np.diff(beat_frames) == 0)[0]
+    over_idx = np.where(beat_frames >= feat.shape[1])[0]
+
+    # Combine and remove bad indices, but keep the last frame if it's out of bounds
+    bad_idx = list(set(rep_idx).union(set(over_idx)) - {len(beat_frames) - 1})
+
+    if bad_idx:
+        beat_frames = np.delete(beat_frames, bad_idx)
+        track_beats = np.delete(track_beats, bad_idx)
+
+    # Synchronize embeddings to the cleaned beat frames
+    synced_feat = librosa.util.sync(feat, beat_frames, aggregate=np.median, pad=True)
+    if synced_feat.shape[1] != len(track_beats) - 1:
+        raise ValueError(f"Beat synchronization shape mismatch! {synced_feat.shape[1]} != {len(track_beats)} - 1")
+    return synced_feat, track_beats
+
+
+def compute_and_sync_feature(audio_path, output_dir, feature_name, beats_dir, recompute, compute_fn):
+    os.makedirs(output_dir, exist_ok=True)
+    track_bn = get_track_basename(audio_path)
+    feat_path = os.path.join(output_dir, f'{track_bn}_{feature_name}.npz')
     
-    yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
+    if recompute or not os.path.exists(feat_path):
+        feat, emb_sr = compute_fn(audio_path)
+        track_beats = beats(audio_path, beats_dir, recompute)['beats']
+        feat_sync, feat_boundaries = beat_sync(feat, track_beats, emb_sr)
+        np.savez(feat_path, feature=feat_sync, ts=feat_boundaries)
+    return np.load(feat_path)
+
+
+def yamnet_emb(audio_path, output_dir='yamnet', beats_dir='beats', recompute=False):
+    def compute_yamnet(audio_path):
+        yamnet_model = load_yamnet_model()
+        audio, sr = cached_load_audio(audio_path, 16000)
+        _, yamnet_emb, _ = yamnet_model(audio)
+        return yamnet_emb.numpy().T, 1.0/0.48
     
-    print('extracting openl3 and yamnet features')
-    for track in tqdm(audio_paths):
-        audio_path = os.path.join(audio_dir, track)
-        track_bn = os.path.basename(audio_path).split('.')[0]
-        
-        #YAMNET
-        yamnet_path = os.path.join(feature_dir, f'{track_bn}_yamnet.npz')
-        if recompute or not os.path.exists(yamnet_path):
-            yamnet_audio, yamnet_sr = librosa.load(track, sr=16000)
-            _, yamnet_emb, _ = yamnet_model(yamnet_audio)
-            resampled_yamnet_emb = librosa.resample(
-                yamnet_emb.numpy().T,
-                orig_sr=1/0.48, target_sr=22050/4096
-            )
-            yamnet_ts = librosa.frames_to_time(
-                np.arange(resampled_yamnet_emb.shape[-1]), 
-                sr=22050, hop_length=4096)
-            np.savez(yamnet_path, feature=resampled_yamnet_emb, ts=yamnet_ts)
-
-        feat_paths.append(yamnet_path)
-        
-        #OPENL3
-        openl3_path = os.path.join(feature_dir, f'{track_bn}_openl3.npz')
-        if recompute or not os.path.exists(openl3_path):
-            y, sr = librosa.load(track, sr=22050)
-            emb, ts = openl3.get_audio_embedding(
-                y, sr, 
-                embedding_size=512, content_type='music'
-            )
-            resampled_emb = librosa.resample(
-                emb.T, orig_sr=1 / (ts[1] - ts[0]),
-                target_sr= sr/4096
-            )
-            ts = librosa.frames_to_time(
-                np.arange(resampled_emb.shape[-1]), 
-                hop_length=4096, sr=sr
-            )
-            np.savez(openl3_path, feature=resampled_emb, ts=ts)
-        feat_paths.append(openl3_path)
-        
-        
-    return feat_paths
+    return compute_and_sync_feature(audio_path, output_dir, 'yamnet', beats_dir, recompute, compute_yamnet)
 
 
-def extract_mfcc_tempogram(
-    audio_dir = '/scratch/qx244/data/salami/audio/10/', 
-    feature_dir = '/scratch/qx244/data/salami/script_out/',
-    recompute = False,
-):
-    # create output directory if not already there.
-    if not os.path.exists(feature_dir):
-        os.makedirs(feature_dir)
+def openl3_emb(audio_path, output_dir='openl3', beats_dir='beats', recompute=False):
+    def compute_openl3(audio_path):
+        openl3_model = load_openl3_model()
+        y, sr = cached_load_audio(audio_path, 22050)
+        emb, ts = openl3.get_audio_embedding(
+            y, sr, model=openl3_model, 
+            input_repr='mel256', content_type='music', embedding_size=512
+        )
+        return emb.T, 1.0 / (ts[1] - ts[0])
     
-    audio_files = [f for f in os.listdir(audio_dir) if os.path.isfile(os.path.join(audio_dir, f))]
-    audio_paths = [os.path.join(audio_dir, f) for f in audio_files]
-    feat_paths = []
+    return compute_and_sync_feature(audio_path, output_dir, 'openl3', beats_dir, recompute, compute_openl3)
 
-    print('extracting mfcc and tempogram features')
-    for track in tqdm(audio_paths):
-        audio_path = os.path.join(audio_dir, track)
-        track_bn = os.path.basename(audio_path).split('.')[0]
-        y, sr = librosa.load(track, sr=22050)
+
+def crema_emb(audio_path, output_dir='crema', beats_dir='beats', recompute=False):
+    def compute_crema(audio_path):
+        with tf.device('CPU'):
+            chord_model = load_crema_model()
+            crema_out = chord_model.outputs(filename=str(audio_path))
         
-        # MFCC
-        mfcc_path = os.path.join(feature_dir, f'{track_bn}_mfcc.npz')
-        if recompute or not os.path.exists(mfcc_path):
-            # compute mfcc
-            mfcc = librosa.feature.mfcc(
-                y=y, sr=sr, n_mfcc=40, 
-                hop_length=4096, n_fft=8192, lifter=0.6)
-            normalized_mfcc = (mfcc - np.mean(mfcc, axis=1)[:, None]) / np.std(mfcc, axis=1, ddof=1)[:,None]
-            mfcc_ts = librosa.frames_to_time(
-                np.arange(normalized_mfcc.shape[-1]), 
-                hop_length=4096, sr=sr, n_fft=8192)
-            np.savez(mfcc_path, feature=normalized_mfcc, ts=mfcc_ts)
-        feat_paths.append(mfcc_path)
-        
-        # TEMPOGRAM
-        tempogram_path = os.path.join(feature_dir, f'{track_bn}_tempogram.npz')
-        if recompute or not os.path.exists(tempogram_path):
-            #compute tempogram
-            novelty = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
-            tempogram = librosa.feature.tempogram(
-                onset_envelope=novelty, sr=sr, 
-                hop_length=512, win_length=384)
-            resampled_tempogram = librosa.resample(
-                tempogram, orig_sr=sr/512, 
-                target_sr=sr/4096)
-            ts = librosa.frames_to_time(
-                np.arange(resampled_tempogram.shape[-1]), 
-                hop_length=4096, sr=sr)
-            np.savez(tempogram_path, feature=resampled_tempogram, ts=ts)
-        feat_paths.append(tempogram_path)
-
-    return feat_paths
-
-
-def extract_crema(
-    audio_dir = '/scratch/qx244/data/salami/audio/10/', 
-    feature_dir = '/scratch/qx244/data/salami/script_out/',
-    recompute = False,
-):
-    # create output directory if not already there.
-    if not os.path.exists(feature_dir):
-        os.makedirs(feature_dir)
-      
-    audio_files = [f for f in os.listdir(audio_dir) if os.path.isfile(os.path.join(audio_dir, f))]
-    audio_paths = [os.path.join(audio_dir, f) for f in audio_files]
-    feat_paths = []
+        crema_op = chord_model.pump.ops[2]
+        emb_sr = crema_op.sr / crema_op.hop_length
+        crema_emb = np.concatenate([crema_out['chord_bass'], crema_out['chord_pitch']], axis=1)
+        return crema_emb.T, emb_sr
     
-    #load CREMA MODEL
-    chord_model = crema.models.chord.ChordModel()
+    return compute_and_sync_feature(audio_path, output_dir, 'crema', beats_dir, recompute, compute_crema)
+
+
+def mfcc(audio_path, output_dir='mfcc', beats_dir='beats', recompute=False):
+    def compute_mfcc(audio_path):
+        y, sr = cached_load_audio(audio_path, 22050)
+        mfcc = librosa.feature.mfcc(
+            y=y, sr=sr, n_mfcc=40, 
+            hop_length=4096, n_fft=8192, lifter=0.6)
+        normalized_mfcc = (mfcc - np.mean(mfcc, axis=1)[:, None]) / np.std(mfcc, axis=1, ddof=1)[:,None]
+        return normalized_mfcc, sr / 4096.0
     
-    print('extracting crema features')
-    for track in tqdm(audio_paths):
-        audio_path = os.path.join(audio_dir, track)
-        track_bn = os.path.basename(audio_path).split('.')[0]
-        
-        #CREMA
-        crema_path = os.path.join(feature_dir, f'{track_bn}_crema.npz')
-        if recompute or not os.path.exists(crema_path):
-            # COMPUTE CREMA AND SAVE
-            crema_out = chord_model.outputs(track)  
-            crema_op = chord_model.pump.ops[2]
-            
-            resampled_crema_pitch = librosa.resample(
-                crema_out['chord_pitch'].T, 
-                orig_sr=crema_op.sr / crema_op.hop_length, 
-                target_sr=22050/4096
-            )
-            
-            resampled_crema_root = librosa.resample(
-                crema_out['chord_root'].T, 
-                orig_sr=crema_op.sr / crema_op.hop_length, 
-                target_sr=22050/4096
-            )
-            
-            resampled_crema_bass = librosa.resample(
-                crema_out['chord_bass'].T, 
-                orig_sr = crema_op.sr / crema_op.hop_length, 
-                target_sr = 22050/4096
-            )
+    return compute_and_sync_feature(audio_path, output_dir, 'mfcc', beats_dir, recompute, compute_mfcc)
 
-            crema_ts = librosa.frames_to_time(
-                np.arange(resampled_crema_pitch.shape[-1]), 
-                hop_length=4096, sr=22050)
 
-            np.savez(crema_path, 
-                     pitch=resampled_crema_pitch, 
-                     root=resampled_crema_root,
-                     bass=resampled_crema_bass,
-                     ts=crema_ts)
-        feat_paths.append(crema_path)
-        
-    return feat_paths
+def tempogram(audio_path, output_dir='tempogram', beats_dir='beats', recompute=False):
+    def compute_tempogram(audio_path):
+        y, sr = cached_load_audio(audio_path, 22050)
+        novelty = librosa.onset.onset_strength(y=y, sr=sr, hop_length=512)
+        tempogram = librosa.feature.tempogram(
+            onset_envelope=novelty, sr=sr, 
+            hop_length=512, win_length=384
+        )
+        return tempogram, sr / 512.0
+    
+    return compute_and_sync_feature(audio_path, output_dir, 'tempogram', beats_dir, recompute, compute_tempogram)
+
+
+def plot(out, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 4))
+    else:
+        fig = ax.get_figure()
+
+    features = out['feature']
+    feat_dim = features.shape[0]
+    # Use specshow to plot the features. 
+    mesh = librosa.display.specshow(
+        features, 
+        x_axis='time', x_coords=out['ts'], 
+        y_axis='none', y_coords = np.arange(feat_dim + 1),
+        ax=ax
+    )    
+    fig.colorbar(mesh, ax=ax)
+    return ax
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Multi Feature Extractor')
     parser.add_argument('audio_dir', help='Path to directory containing audio files')
-    parser.add_argument('feature_dir', help='Path to feature output directory')
+    parser.add_argument('out_dir', help='Path to feature output directory')
 
     parser.add_argument(
         '--recompute', 
@@ -195,7 +230,20 @@ if __name__ == '__main__':
 
     kwargs = parser.parse_args()
 
-    extract_crema(kwargs.audio_dir, kwargs.feature_dir, kwargs.recompute)
-    extract_openl3_yamnet(kwargs.audio_dir, kwargs.feature_dir, kwargs.recompute)
-    extract_mfcc_tempogram(kwargs.audio_dir, kwargs.feature_dir, kwargs.recompute)
+    # collect all audio files in the audio_dir
+    audio_files = [f for f in os.listdir(kwargs.audio_dir) if os.path.isfile(os.path.join(kwargs.audio_dir, f))]
+    audio_paths = [os.path.join(kwargs.audio_dir, f) for f in audio_files]
+    feats_dir = os.path.join(kwargs.out_dir, 'feats')
+    beats_dir = os.path.join(kwargs.out_dir, 'beats')
 
+    for audio_path in tqdm(audio_paths):
+        try:
+            mfcc(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            tempogram(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            crema_emb(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            openl3_emb(audio_path, feats_dir, beats_dir, kwargs.recompute)
+            yamnet_emb(audio_path, feats_dir, beats_dir, kwargs.recompute)
+        except Exception as e:
+            print(f"Failed to process {audio_path}: {type(e).__name__}: {e}")
+    
+    
